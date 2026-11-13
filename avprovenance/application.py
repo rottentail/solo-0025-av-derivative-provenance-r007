@@ -10,7 +10,9 @@ from .errors import (
     IntegrityMismatch,
     PlanInvalid,
     RenditionNotCompleted,
+    ServiceShuttingDown,
 )
+from .lifecycle import ServiceLifecycle, WorkLease
 from .models import (
     IntegrityAudit,
     MediaAsset,
@@ -42,12 +44,17 @@ from .validation import (
 
 
 class MediaProvenanceApplication:
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        lifecycle: ServiceLifecycle | None = None,
+    ) -> None:
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
+        self.lifecycle = lifecycle if lifecycle is not None else ServiceLifecycle()
 
     def _asset_bytes(self, asset: MediaAsset) -> bytes:
         return self.content_files.read(asset.content_key)
@@ -149,77 +156,94 @@ class MediaProvenanceApplication:
             created_at=now,
             updated_at=now,
         )
-        self.repository.create_rendition(rendition)
-        self.repository.transition_rendition(rendition.id, "running")
-
+        lease = self.lifecycle.acquire_work("rendition")
         try:
-            primary_bytes = self._asset_bytes(primary)
-            secondary_bytes = self._asset_bytes(secondary) if secondary else None
-            outcome = execute_plan(
-                primary_bytes,
-                plan.operations,
-                secondary_bytes,
-            )
-            output_digest = sha256_hex(outcome.data)
-            output_key = self.content_files.key_for_digest(output_digest)
-            output_existed = self.content_files.exists(output_key)
-            self.content_files.write(outcome.data, output_digest)
-            output_asset = MediaAsset(
-                id=new_identifier("asset"),
-                filename=output_name,
-                kind=outcome.descriptor.kind,
-                sha256=output_digest,
-                size_bytes=len(outcome.data),
-                content_key=output_key,
-                descriptor=outcome.descriptor,
-                created_at=utc_now(),
-            )
-            edge = ProvenanceEdge(
-                id=new_identifier("edge"),
-                rendition_id=rendition.id,
-                parent_asset_ids=[
-                    item
-                    for item in (primary.id, secondary.id if secondary else None)
-                    if item is not None
-                ],
-                operation_types=list(outcome.operation_types),
-                plan_digest=plan.digest,
-                output_asset_id=output_asset.id,
-                created_at=utc_now(),
-            )
+            self.repository.create_rendition(rendition)
+            lease.attach_rendition(rendition.id)
+            self.repository.transition_rendition(rendition.id, "running")
+
             try:
-                completed = self.repository.complete_rendition(
-                    rendition.id,
-                    output_asset,
-                    edge,
+                primary_bytes = self._asset_bytes(primary)
+                secondary_bytes = self._asset_bytes(secondary) if secondary else None
+                outcome = execute_plan(
+                    primary_bytes,
+                    plan.operations,
+                    secondary_bytes,
                 )
-            except Exception:
-                if not output_existed:
-                    self.content_files.remove(output_key)
+                output_digest = sha256_hex(outcome.data)
+                output_key = self.content_files.key_for_digest(output_digest)
+                output_existed = self.content_files.exists(output_key)
+                self.content_files.write(outcome.data, output_digest)
+                output_asset = MediaAsset(
+                    id=new_identifier("asset"),
+                    filename=output_name,
+                    kind=outcome.descriptor.kind,
+                    sha256=output_digest,
+                    size_bytes=len(outcome.data),
+                    content_key=output_key,
+                    descriptor=outcome.descriptor,
+                    created_at=utc_now(),
+                )
+                edge = ProvenanceEdge(
+                    id=new_identifier("edge"),
+                    rendition_id=rendition.id,
+                    parent_asset_ids=[
+                        item
+                        for item in (primary.id, secondary.id if secondary else None)
+                        if item is not None
+                    ],
+                    operation_types=list(outcome.operation_types),
+                    plan_digest=plan.digest,
+                    output_asset_id=output_asset.id,
+                    created_at=utc_now(),
+                )
+                try:
+                    completed = self.repository.complete_rendition(
+                        rendition.id,
+                        output_asset,
+                        edge,
+                    )
+                except Exception:
+                    if not output_existed:
+                        self.content_files.remove(output_key)
+                    raise
+                return self._rendition_view(completed)
+            except ApplicationError as exc:
+                self._fail_if_running(rendition.id, exc.code, exc.message)
                 raise
-            return self._rendition_view(completed)
-        except ApplicationError as exc:
-            current = self.repository.get_rendition(rendition.id)
-            if current.status == "running":
-                self.repository.fail_rendition(
-                    rendition.id,
-                    exc.code,
-                    exc.message,
-                )
-            raise
-        except Exception as exc:
-            current = self.repository.get_rendition(rendition.id)
-            if current.status == "running":
-                self.repository.fail_rendition(
+            except Exception as exc:
+                self._fail_if_running(
                     rendition.id,
                     "RENDER_FAILED",
                     "The rendition failed before completion.",
                 )
-            raise ApplicationError(
-                code="RENDER_FAILED",
-                message="The rendition failed before completion.",
-                status=409,
-            ) from exc
+                raise ApplicationError(
+                    code="RENDER_FAILED",
+                    message="The rendition failed before completion.",
+                    status=409,
+                ) from exc
+        finally:
+            lease.release()
+
+    def _fail_if_running(
+        self,
+        rendition_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        try:
+            current = self.repository.get_rendition(rendition_id)
+        except ApplicationError:
+            return
+        if current.status == "running":
+            try:
+                self.repository.fail_rendition(
+                    rendition_id,
+                    error_code,
+                    error_message,
+                )
+            except ApplicationError:
+                return
 
     def get_rendition(self, rendition_id: str) -> dict[str, Any]:
         return self._rendition_view(self.repository.get_rendition(rendition_id))

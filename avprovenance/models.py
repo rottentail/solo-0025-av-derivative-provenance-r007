@@ -9,8 +9,8 @@ from .errors import InvalidStateTransition
 from .serialization import deep_copy, utc_now
 
 
-TERMINAL_RENDITION_STATES = {"completed", "failed"}
-TERMINAL_CHECK_STATES = {"verified", "mismatch"}
+TERMINAL_RENDITION_STATES = {"completed", "failed", "interrupted"}
+TERMINAL_CHECK_STATES = {"verified", "mismatch", "abandoned"}
 
 
 @dataclass(frozen=True)
@@ -145,10 +145,11 @@ class Rendition:
 
     def transition_to(self, target: str) -> None:
         allowed = {
-            "queued": {"running"},
-            "running": {"completed", "failed"},
+            "queued": {"running", "interrupted"},
+            "running": {"completed", "failed", "interrupted"},
             "completed": set(),
             "failed": set(),
+            "interrupted": set(),
         }
         if target not in allowed.get(self.status, set()):
             raise InvalidStateTransition(self.status, target)

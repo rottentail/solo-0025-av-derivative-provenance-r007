@@ -127,12 +127,39 @@ class InvalidStateTransition(ApplicationError):
         )
 
 
+class ServiceShuttingDown(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__(
+            code="SERVICE_SHUTTING_DOWN",
+            message="The service is stopping and does not accept new derivative work.",
+            status=503,
+        )
+
+
+class ShutdownIncomplete(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__(
+            code="SHUTDOWN_INCOMPLETE",
+            message="The rendition did not finish within the stop budget.",
+            status=503,
+        )
+
+
 class PersistenceFailure(ApplicationError):
     def __init__(self, message: str) -> None:
         super().__init__(
             code="PERSISTENCE_FAILURE",
             message=message,
             status=500,
+        )
+
+
+class StorageSealed(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__(
+            code="STORAGE_SEALED",
+            message="The service stopped accepting durable changes.",
+            status=503,
         )
 
 

@@ -14,6 +14,8 @@ from ..models import (
     MediaAsset,
     ProvenanceEdge,
     Rendition,
+    TERMINAL_CHECK_STATES,
+    TERMINAL_RENDITION_STATES,
 )
 from ..serialization import deep_copy
 from .state_file import JsonStateFile
@@ -138,6 +140,99 @@ class ProvenanceRepository:
             "parents": parents,
             "output": output,
             "edge": edge.to_dict(),
+        }
+
+    def interrupt_rendition(
+        self,
+        rendition_id: str,
+        reason: str,
+        detail: str,
+    ) -> Rendition | None:
+        """Mark admitted-but-unfinished work as interrupted.
+
+        Returns ``None`` when the rendition already reached a terminal state,
+        so a late stop can never overwrite a completed result.
+        """
+
+        def mutate(state: dict[str, Any]) -> Rendition | None:
+            raw = state["renditions"].get(rendition_id)
+            if not isinstance(raw, dict):
+                return None
+            rendition = Rendition.from_dict(deep_copy(raw))
+            if rendition.status in TERMINAL_RENDITION_STATES:
+                return None
+            rendition.error_code = reason
+            rendition.error_message = detail
+            rendition.transition_to("interrupted")
+            state["renditions"][rendition_id] = rendition.to_dict()
+            return rendition
+
+        return self.state_file.mutate(mutate)
+
+    def find_pending_renditions(self) -> list[str]:
+        state = self.state_file.read()
+        return sorted(
+            identifier
+            for identifier, raw in state["renditions"].items()
+            if isinstance(raw, dict)
+            and raw.get("status") in {"queued", "running"}
+        )
+
+    def find_pending_checks(self) -> list[str]:
+        state = self.state_file.read()
+        return sorted(
+            identifier
+            for identifier, raw in state["integrity_checks"].items()
+            if isinstance(raw, dict) and raw.get("status") == "pending"
+        )
+
+    def abandon_check(
+        self,
+        check_id: str,
+        reason: str,
+    ) -> IntegrityAudit | None:
+        def mutate(state: dict[str, Any]) -> IntegrityAudit | None:
+            raw = state["integrity_checks"].get(check_id)
+            if not isinstance(raw, dict):
+                return None
+            audit = IntegrityAudit.from_dict(deep_copy(raw))
+            if audit.status in TERMINAL_CHECK_STATES:
+                return None
+            audit.finish(
+                status="abandoned",
+                expected_digest=audit.expected_digest,
+                reproduced_digest=None,
+                expected_descriptor=audit.expected_descriptor,
+                reproduced_descriptor=None,
+                reason=reason,
+            )
+            state["integrity_checks"][check_id] = audit.to_dict()
+            return audit
+
+        return self.state_file.mutate(mutate)
+
+    def recover_incomplete_work(self) -> dict[str, int]:
+        """Settle work that a previous process left behind before it could finish.
+
+        A process that was stopped mid-operation leaves ``running`` or
+        ``pending`` records behind. On the next start those records are
+        converted to explicit incomplete facts so they are never mistaken for
+        completed output.
+        """
+
+        pending_renditions = self.find_pending_renditions()
+        for rendition_id in pending_renditions:
+            self.interrupt_rendition(
+                rendition_id,
+                "RENDER_INTERRUPTED",
+                "The rendition did not finish before the service stopped.",
+            )
+        pending_checks = self.find_pending_checks()
+        for check_id in pending_checks:
+            self.abandon_check(check_id, "check_interrupted")
+        return {
+            "renditions": len(pending_renditions),
+            "integrity_checks": len(pending_checks),
         }
 
     def insert_integrity_audit(self, audit: IntegrityAudit) -> IntegrityAudit:
